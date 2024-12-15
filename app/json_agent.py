@@ -1,46 +1,98 @@
 import os
 import json
 from dotenv import load_dotenv
+from pymongo.mongo_client import MongoClient
+from pymongo.server_api import ServerApi
 
-from langchain_community.agent_toolkits import JsonToolkit, create_json_agent
-from langchain_community.tools.json.tool import JsonSpec
 from langchain_groq import ChatGroq
+from langchain_core.tools import tool
+from langchain_core.prompts import PromptTemplate
+
 
 load_dotenv()
 os.environ['GROQ_API_KEY'] = os.getenv("GROQ_API_KEY")
+uri = os.getenv("MONGODB_API_KEY")
 
+client = MongoClient(uri, server_api=ServerApi('1'))
+try:
+    client.admin.command('ping')
+    print("Pinged your deployment. You successfully connected to MongoDB!")
+except Exception as e:
+    print(e)
+
+db = client.sample_mflix
 llm = ChatGroq(model="llama3-8b-8192")
 
-def read_json():
-    with open("app/Procore_Subcontrator_Invoice.json") as f:
-        data = json.load(f)
-    if isinstance(data, list):
-    # Option 1: Extract the first item if it makes sense
-        if len(data) > 0:
-            data = data[0]  # If you want the first object
-        # Option 2: Convert list to dict using indices
-        else:
-            data = {str(i): item for i, item in enumerate(data)}
+@tool
+def get_schema()->dict:
+    """Retrieve the schema of the collection by analyzing the first document."""
+    collection_name = 'movies'
+    print(f'GET SCHEMA FOR COLLECTION: {collection_name}')
+    collection = db[collection_name]
+    sample_document = collection.find_one()  # Get a single document to infer the schema
+    if sample_document is None:
+        print('No documents found in collection')
+        return {}
 
-    return data
+    schema = {key: type(value).__name__ for key, value in sample_document.items()}
+    print(f'Schema for {collection_name}: {schema}')
+    return schema
+
+@tool
+def fetch_query_results(query:dict) -> list[dict]:
+    """Execute a query on the collection and return the results as a list of documents."""
+    print(f'FETCH QUERY RESULTS FROM COLLECTION: Moview WITH QUERY: {query}')
+    collection = db['movies']
+    results = list(collection.find(query))
+    print(f'Results: {results}')
+    return results
 
 
-data = read_json()
+        
+tools = [get_schema,fetch_query_results]
+llm_with_tools = llm.bind_tools(tools)
 
-def invoke_agent(query:str):
-    data = read_json()
 
-    json_spec = JsonSpec(dict_=data, max_length=4000)
-    json_toolkit = JsonToolkit(spec=json_spec)
 
-    json_agent_executor =  create_json_agent(
-        llm=llm,
-        toolkit=json_toolkit,
-        verbose=True
+prompt_template = PromptTemplate.from_template(
+    (
+        """
+        you are a helpful chatbot that can interact with MongoDB database. 
+        You will take user questions and turn them into MongoDB quieries using the tools available.
+        Use get_schema to get the scheam of the collection and use fetch_query_results to execute a query
+        inside MongoDB find function. Give just the query that will execute in MongoDB find function.
+
+        {query}
+        """
+    ),
+)
+
+user_query = "Find information about the movie The great train robbery from the database"
+response = llm_with_tools.invoke(prompt_template.invoke({"query": user_query}))
+print(response)
+database_data = fetch_query_results.invoke(response.tool_calls[-1]['args'])
+print(database_data)
+
+
+prompt_template = PromptTemplate.from_template(
+    (
+        """
+        you are a helpful chatbot that can interact with MongoDB database. 
+        You have given a data retrieved from database, and using that information you need to answer 
+        the users query. Give short relevant answers to the question
+
+        DATA:
+        {data}
+
+        user question
+        {query}
+        """
+        ),
+
     )
+user_query = "Find information about the movie The great train robbery from the database"
+final_response = llm.invoke(prompt_template.invoke({"query": user_query, "data":database_data}))
+
+
+print(final_response)
     
-    resp = json_agent_executor.run(
-        query
-    )
-
-    return resp
